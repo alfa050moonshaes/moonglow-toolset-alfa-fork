@@ -3888,7 +3888,7 @@ fn run(cli: &Cli) -> Result<Output> {
                 let _ = mg_module::nasher::SOURCE_CACHE.set(c.clone());
             }
             let (mut p, current) = mg_module::nasher::Project::open(project, target.as_deref())?;
-            let (kept, read) = p.from_cache;
+            let (cache_kept, cache_read) = p.from_cache;
             let read = |path: &Path| -> Result<mg_module::nasher::Resources> {
                 let m = Module::open(path)?;
                 Ok(m.keys().filter_map(|k| Some((*k, m.shared(k)?.clone()))).collect())
@@ -3905,7 +3905,10 @@ fn run(cli: &Cli) -> Result<Output> {
                 out.note(format!("warning: {w}"));
             }
             if cache.is_some() {
-                out.note(format!("read {read} of {} source files ({kept} unchanged, from the cache)", kept + read));
+                out.note(format!(
+                    "read {cache_read} of {} source files ({cache_kept} unchanged, from the cache)",
+                    cache_kept + cache_read
+                ));
             }
             let shown = |f: &Path| f.strip_prefix(project).unwrap_or(f).display().to_string();
             for f in &report.written {
