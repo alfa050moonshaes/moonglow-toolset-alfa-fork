@@ -7,6 +7,8 @@ name: Build mg (ALFA)
 on:
   push:
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     strategy:
@@ -36,3 +38,26 @@ jobs:
         with:
           name: mg-${{ runner.os }}
           path: target/dist/${{ matrix.exe }}
+
+  # Publish both builds as a release of this fork, so they can be downloaded
+  # from a plain link (and checked against the SHA-256 printed above).
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="mg-5.2.0-nocompile1"
+          mv dist/mg-Windows/mg.exe "dist/mg-5.2.0-nocompile1.exe"
+          mv dist/mg-Linux/mg "dist/mg-5.2.0-nocompile1-linux"
+          (cd dist && sha256sum mg-5.2.0-nocompile1.exe mg-5.2.0-nocompile1-linux > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "mg 5.2.0 with mg build --no-compile (ALFA)" \
+            --notes "Moonglow 5.2.0's mg command-line tool with one change: a --no-compile option for mg build. Built from branch alfa/no-compile-5.2.0 by its workflow." \
+            dist/mg-5.2.0-nocompile1.exe dist/mg-5.2.0-nocompile1-linux dist/SHA256SUMS.txt
