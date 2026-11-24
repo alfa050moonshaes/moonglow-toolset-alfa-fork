@@ -1,0 +1,38 @@
+# ALFA: builds Moonglow's command-line tool (mg) with our --no-compile
+# option for `mg build`, the same way Moonglow's own release builds it
+# (packaging/windows/build-installer.ps1: `cargo build --profile dist
+# --locked -p mg`). Moonglow's own CI and release workflows are removed on
+# this branch so pushes here only run this.
+name: Build mg (ALFA)
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            exe: mg.exe
+          - os: ubuntu-22.04
+            exe: mg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Build
+        run: cargo build --profile dist --locked -p mg
+      - name: Check it runs
+        shell: bash
+        run: |
+          target/dist/${{ matrix.exe }} --version
+          target/dist/${{ matrix.exe }} build --help | grep -- --no-compile
+          sha256sum target/dist/${{ matrix.exe }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mg-${{ runner.os }}
+          path: target/dist/${{ matrix.exe }}

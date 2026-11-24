@@ -1082,6 +1082,10 @@ enum Cmd {
         /// it.
         #[arg(long)]
         ndb: bool,
+        /// Don't compile the scripts: pack the sources only, as
+        /// `nasher pack --noCompile` does (no game install needed).
+        #[arg(long, conflicts_with_all = ["keep_going", "ndb"])]
+        no_compile: bool,
     },
     /// Put a module into a nasher project: its resources as source files
     /// (GFF as JSON), with a nasher.cfg like `nasher init` writes unless the
@@ -3739,7 +3743,7 @@ fn run(cli: &Cli) -> Result<Output> {
             out.note(format!("updated {total} objects from {} blueprints", wanted.len()));
             out
         }
-        Cmd::Build { project, target, output, keep_going, ndb } => {
+        Cmd::Build { project, target, output, keep_going, ndb, no_compile } => {
             // A target that packs a talk table: its JSON made into the
             // table, as nasher packs it.
             let package = mg_module::nasher::Package::read(project)?;
@@ -3765,6 +3769,19 @@ fn run(cli: &Cli) -> Result<Output> {
                 for w in &p.warnings {
                     out.note(format!("warning: {w}"));
                 }
+            }
+            if *no_compile {
+                // Pack the sources as they are: no scripts compiled, and no
+                // game install looked up (so models kept as text, if the
+                // project file asks for them compiled, go in as text).
+                let none = |_: &str, _: ResType| -> Option<Vec<u8>> { None };
+                let (path, bytes, _models) =
+                    m.target_archive_with(&none)?.context("not a nasher project")?;
+                let path = output.clone().unwrap_or(path);
+                write_bytes_whole(&path, &bytes)?;
+                out.json = json!({ "compiled": null, "packed": path_text(&path) });
+                out.note(format!("packed {} (scripts not compiled)", path.display()));
+                return Ok(out);
             }
             let gi = install(cli)?;
             let rm = module_resman(&gi, &m, &mut out)?;
