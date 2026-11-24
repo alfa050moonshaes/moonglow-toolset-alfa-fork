@@ -1116,6 +1116,69 @@ impl Project {
         Ok(report)
     }
 
+    /// ALFA (`mg unpack`): takes a module saved in another editor (the
+    /// toolset) back into the project, as `nasher unpack --removeDeleted`
+    /// does, then saves the project ([`Project::save`]: only files whose
+    /// contents changed are written). `current` is the project's resources
+    /// as [`Project::open`] read them, `saved` the module's.
+    ///
+    /// With `base`, the module as it was when packed: only what changed
+    /// between `base` and `saved` is taken (new, changed or deleted in the
+    /// editor). Everything else stays as the project has it now, so files
+    /// changed in the project since it was packed (a script edited, a pull)
+    /// are not put back to the module's older copies. A resource whose bytes
+    /// differ but whose source file would read the same counts as
+    /// unchanged. Without `base`, the project becomes the module.
+    ///
+    /// Compiled scripts and their debug files (`.ncs`, `.ndb`) are never
+    /// taken, as nasher's unpack skips them. Returns what was saved and how
+    /// many resources were taken from `saved`.
+    pub fn unpack(
+        &mut self,
+        current: &Resources,
+        saved: &Resources,
+        base: Option<&Resources>,
+    ) -> Result<(SaveReport, usize), ModuleError> {
+        let skip = |k: &ResKey| matches!(k.restype, ResType::NCS | ResType::NDB);
+        let mut merged: Resources = match base {
+            Some(_) => current.iter().filter(|(k, _)| !skip(k)).map(|(k, v)| (*k, v.clone())).collect(),
+            None => Resources::new(),
+        };
+        let mut taken = 0;
+        for (key, bytes) in saved {
+            if skip(key) {
+                continue;
+            }
+            if let Some(was) = base.and_then(|b| b.get(key))
+                && (was[..] == bytes[..] || self.reads_the_same(key, was, bytes))
+            {
+                continue;
+            }
+            merged.insert(*key, bytes.clone());
+            taken += 1;
+        }
+        if let Some(base) = base {
+            for key in base.keys() {
+                if !skip(key) && !saved.contains_key(key) {
+                    merged.shift_remove(key);
+                }
+            }
+        }
+        let report = self.save(&merged)?;
+        Ok((report, taken))
+    }
+
+    /// Whether two versions of a resource make the same source file.
+    fn reads_the_same(&self, key: &ResKey, a: &[u8], b: &[u8]) -> bool {
+        let src = self.sources.get(key);
+        let form = src.map_or_else(|| self.new_form(key), |s| s.form);
+        let file = src.map(|s| &s.file[..]);
+        match (self.source_bytes(key, form, a, file), self.source_bytes(key, form, b, file)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+    }
+
     /// The resources the target's file holds: those its filters don't leave
     /// out, with its `modName`, `modDescription` and `modMinGameVersion` in
     /// `module.ifo`, as nasher packs them.

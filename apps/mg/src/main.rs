@@ -1087,6 +1087,25 @@ enum Cmd {
         #[arg(long, conflicts_with_all = ["keep_going", "ndb"])]
         no_compile: bool,
     },
+    /// ALFA: Unpack a module saved in the toolset into its nasher project,
+    /// as `nasher unpack --removeDeleted` does: only files whose contents
+    /// changed are written, new ones go where nasher.cfg's rules put them,
+    /// and the files of resources the module no longer has are deleted.
+    /// Compiled scripts (.ncs, .ndb) are not taken.
+    Unpack {
+        /// The module the toolset saved.
+        module: PathBuf,
+        /// The project's folder (with its nasher.cfg).
+        project: PathBuf,
+        /// The module as it was packed. Only what changed between it and
+        /// MODULE is taken; files changed in the project since are kept.
+        #[arg(long)]
+        base: Option<PathBuf>,
+        /// The target to unpack into (default: the target that packs a
+        /// module).
+        #[arg(long)]
+        target: Option<String>,
+    },
     /// Put a module into a nasher project: its resources as source files
     /// (GFF as JSON), with a nasher.cfg like `nasher init` writes unless the
     /// folder has one.
@@ -3846,6 +3865,39 @@ fn run(cli: &Cli) -> Result<Output> {
                 results.len() - failed,
                 results.len(),
                 path.display()
+            ));
+            out
+        }
+        Cmd::Unpack { module, project, base, target } => {
+            let (mut p, current) = mg_module::nasher::Project::open(project, target.as_deref())?;
+            let read = |path: &Path| -> Result<mg_module::nasher::Resources> {
+                let m = Module::open(path)?;
+                Ok(m.keys().filter_map(|k| Some((*k, m.shared(k)?.clone()))).collect())
+            };
+            let saved = read(module)?;
+            let base = base.as_deref().map(read).transpose()?;
+            let (report, taken) = p.unpack(&current, &saved, base.as_ref())?;
+            let mut out = Output::new(json!({
+                "taken": taken,
+                "written": report.written.iter().map(|f| path_text(f)).collect::<Vec<_>>(),
+                "removed": report.removed.iter().map(|f| path_text(f)).collect::<Vec<_>>(),
+            }));
+            for w in &p.warnings {
+                out.note(format!("warning: {w}"));
+            }
+            let shown = |f: &Path| f.strip_prefix(project).unwrap_or(f).display().to_string();
+            for f in &report.written {
+                out.note(format!("wrote {}", shown(f)));
+            }
+            for f in &report.removed {
+                out.note(format!("removed {}", shown(f)));
+            }
+            out.note(format!(
+                "unpacked {}: {} changed in the module, {} files written, {} removed",
+                module.display(),
+                taken,
+                report.written.len(),
+                report.removed.len()
             ));
             out
         }
