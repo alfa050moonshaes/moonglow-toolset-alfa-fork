@@ -34,6 +34,7 @@ jobs:
           target/dist/${{ matrix.exe }} --version
           target/dist/${{ matrix.exe }} build --help | grep -- --no-compile
           target/dist/${{ matrix.exe }} update-project --help | grep -- --base
+          target/dist/${{ matrix.exe }} build --help | grep -- --cache
           sha256sum target/dist/${{ matrix.exe }}
       - uses: actions/upload-artifact@v4
         with:
@@ -53,12 +54,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="mg-5.2.0-alfa2"
-          mv dist/mg-Windows/mg.exe "dist/mg-5.2.0-alfa2.exe"
-          mv dist/mg-Linux/mg "dist/mg-5.2.0-alfa2-linux"
-          (cd dist && sha256sum mg-5.2.0-alfa2.exe mg-5.2.0-alfa2-linux > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          tag="mg-5.2.0-alfa3"
+          mv dist/mg-Windows/mg.exe "dist/mg-5.2.0-alfa3.exe"
+          mv dist/mg-Linux/mg "dist/mg-5.2.0-alfa3-linux"
+          (cd dist && sha256sum mg-5.2.0-alfa3.exe mg-5.2.0-alfa3-linux > SHA256SUMS.txt && cat SHA256SUMS.txt)
           gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "mg 5.2.0 with mg build --no-compile and mg update-project (ALFA)" \
-            --notes "Moonglow 5.2.0's mg command-line tool with two additions: a --no-compile option for mg build, and an mg update-project command (unpacks a toolset-saved module into the project). Built from branch alfa/no-compile-5.2.0 by its workflow." \
-            dist/mg-5.2.0-alfa2.exe dist/mg-5.2.0-alfa2-linux dist/SHA256SUMS.txt
+            --title "mg 5.2.0 with mg build --no-compile, mg update-project and --cache (ALFA)" \
+            --notes "Moonglow 5.2.0's mg command-line tool with three additions: mg build --no-compile, an mg update-project command (unpacks a toolset-saved module into the project), and a --cache option for both. Built from branch alfa/no-compile-5.2.0 by its workflow." \
+            dist/mg-5.2.0-alfa3.exe dist/mg-5.2.0-alfa3-linux dist/SHA256SUMS.txt

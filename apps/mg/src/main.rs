@@ -1086,6 +1086,10 @@ enum Cmd {
         /// `nasher pack --noCompile` does (no game install needed).
         #[arg(long, conflicts_with_all = ["keep_going", "ndb"])]
         no_compile: bool,
+        /// ALFA: keep a cache of the project's source files in this file:
+        /// those unchanged since (by time and size) are not read again.
+        #[arg(long)]
+        cache: Option<PathBuf>,
     },
     /// ALFA: Take a module saved in the toolset back into its nasher project,
     /// as `nasher unpack --removeDeleted` does: only files whose contents
@@ -1105,6 +1109,10 @@ enum Cmd {
         /// module).
         #[arg(long)]
         target: Option<String>,
+        /// ALFA: keep a cache of the project's source files in this file:
+        /// those unchanged since (by time and size) are not read again.
+        #[arg(long)]
+        cache: Option<PathBuf>,
     },
     /// Put a module into a nasher project: its resources as source files
     /// (GFF as JSON), with a nasher.cfg like `nasher init` writes unless the
@@ -3762,7 +3770,10 @@ fn run(cli: &Cli) -> Result<Output> {
             out.note(format!("updated {total} objects from {} blueprints", wanted.len()));
             out
         }
-        Cmd::Build { project, target, output, keep_going, ndb, no_compile } => {
+        Cmd::Build { project, target, output, keep_going, ndb, no_compile, cache } => {
+            if let Some(c) = cache {
+                let _ = mg_module::nasher::SOURCE_CACHE.set(c.clone());
+            }
             // A target that packs a talk table: its JSON made into the
             // table, as nasher packs it.
             let package = mg_module::nasher::Package::read(project)?;
@@ -3787,6 +3798,10 @@ fn run(cli: &Cli) -> Result<Output> {
             if let Some(p) = &m.project {
                 for w in &p.warnings {
                     out.note(format!("warning: {w}"));
+                }
+                if cache.is_some() {
+                    let (kept, read) = p.from_cache;
+                    out.note(format!("read {read} of {} source files ({kept} unchanged, from the cache)", kept + read));
                 }
             }
             if *no_compile {
@@ -3868,8 +3883,12 @@ fn run(cli: &Cli) -> Result<Output> {
             ));
             out
         }
-        Cmd::UpdateProject { module, project, base, target } => {
+        Cmd::UpdateProject { module, project, base, target, cache } => {
+            if let Some(c) = cache {
+                let _ = mg_module::nasher::SOURCE_CACHE.set(c.clone());
+            }
             let (mut p, current) = mg_module::nasher::Project::open(project, target.as_deref())?;
+            let (kept, read) = p.from_cache;
             let read = |path: &Path| -> Result<mg_module::nasher::Resources> {
                 let m = Module::open(path)?;
                 Ok(m.keys().filter_map(|k| Some((*k, m.shared(k)?.clone()))).collect())
@@ -3884,6 +3903,9 @@ fn run(cli: &Cli) -> Result<Output> {
             }));
             for w in &p.warnings {
                 out.note(format!("warning: {w}"));
+            }
+            if cache.is_some() {
+                out.note(format!("read {read} of {} source files ({kept} unchanged, from the cache)", kept + read));
             }
             let shown = |f: &Path| f.strip_prefix(project).unwrap_or(f).display().to_string();
             for f in &report.written {

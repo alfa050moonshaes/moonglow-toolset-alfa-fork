@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use indexmap::IndexMap;
 use mg_core::{ResRef, ResType};
@@ -20,8 +20,9 @@ struct Source {
     path: Arc<Path>,
     /// Whether the file is the resource itself or a GFF kept as text.
     form: Form,
-    /// The file's bytes.
-    file: Arc<[u8]>,
+    /// The file's bytes. (ALFA: read only when first wanted, for a
+    /// resource taken from the source cache, [`SOURCE_CACHE`].)
+    file: OnceLock<Arc<[u8]>>,
     /// The resource's bytes they stand for.
     resource: Arc<[u8]>,
     /// The file's time and size when it was last found as it was read
@@ -29,6 +30,20 @@ struct Source {
     /// ([`Project::outside`]).
     stamp: Option<Stamp>,
 }
+
+impl Source {
+    /// The file's bytes: read now if they weren't when it was opened.
+    fn file(&self) -> &Arc<[u8]> {
+        self.file.get_or_init(|| Arc::from(std::fs::read(&self.path).unwrap_or_default()))
+    }
+}
+
+/// ALFA: where [`Project::open`] keeps a cache of the resources it read
+/// from the source files, by each file's path, time and size (set by the
+/// command line's `--cache`). A file whose time and size are as cached is
+/// not read again: its resource is taken from the cache (its text is read
+/// only if a save needs it). Unset: no cache.
+pub static SOURCE_CACHE: OnceLock<PathBuf> = OnceLock::new();
 
 /// An open nasher project.
 #[derive(Debug, Clone)]
@@ -47,6 +62,9 @@ pub struct Project {
     /// file, which the next save makes the resource's own (the other
     /// spelling's, read, written there), as nasher's pack does.
     spellings: HashMap<ResKey, PathBuf>,
+    /// ALFA: how many source files were taken from [`SOURCE_CACHE`] and
+    /// how many read, when it was opened.
+    pub from_cache: (usize, usize),
 }
 
 /// Adds the line `exclude` to the sources of the target named `target` in
@@ -268,9 +286,14 @@ impl Project {
             warnings: Vec::new(),
             left_out: Vec::new(),
             spellings: HashMap::new(),
+            from_cache: (0, 0),
         };
         let conv = project.conversion();
         let mut resources = IndexMap::new();
+        // ALFA: the source cache, if one is kept ([`SOURCE_CACHE`]).
+        let fingerprint = source_cache::fingerprint(&project.settings, conv);
+        let mut cached = SOURCE_CACHE.get().map(|c| source_cache::read(c, &fingerprint));
+        let mut to_cache: Vec<(String, crate::outside::Stamp, Arc<[u8]>)> = Vec::new();
         for path in t.source_files(root).map_err(bad)? {
             let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
             // (A file half written when Moonglow stopped: not the
@@ -327,6 +350,26 @@ impl Project {
             // (Its time and size before it is read: a later look reads
             // only the files changed since.)
             let stamp = stamp(&path);
+            // ALFA: as cached, with the same time and size: not read.
+            let rel = source_cache::relative(root, &path);
+            let hit = match (cached.as_mut(), stamp) {
+                (Some(c), Some(st)) => c.remove(&rel).filter(|(was, _)| *was == st),
+                _ => None,
+            };
+            if let Some((st, resource)) = hit {
+                if let Some(twin) = twin {
+                    project.spellings.insert(key, twin);
+                }
+                resources.insert(key, resource.clone());
+                to_cache.push((rel, st, resource.clone()));
+                project.sources.insert(
+                    key,
+                    Source { path: path.into(), form, file: OnceLock::new(), resource, stamp },
+                );
+                project.from_cache.0 += 1;
+                continue;
+            }
+            project.from_cache.1 += 1;
             let file: Arc<[u8]> = Arc::from(std::fs::read(&path).map_err(io(&path))?);
             // A file that can't be read (JSON broken by a merge, say) is
             // left out, and said: the rest of the project opens.
@@ -345,7 +388,19 @@ impl Project {
                 project.spellings.insert(key, twin);
             }
             resources.insert(key, resource.clone());
+            if let Some(st) = stamp {
+                to_cache.push((rel, st, resource.clone()));
+            }
+            let file = OnceLock::from(file);
             project.sources.insert(key, Source { path: path.into(), form, file, resource, stamp });
+        }
+        // ALFA: the cache written again where anything changed (a file
+        // read, or one gone). A cache that can't be written is no error:
+        // the next open reads those files again.
+        if let Some(c) = SOURCE_CACHE.get()
+            && (project.from_cache.1 > 0 || cached.as_ref().is_none_or(|left| !left.is_empty()))
+        {
+            let _ = source_cache::write(c, &fingerprint, &to_cache);
         }
         if super::kept_as(&project.settings).is_none()
             && project.package.targets.iter().any(Target::is_talk_table)
@@ -722,7 +777,7 @@ impl Project {
         let mut v: Vec<PathBuf> = self
             .sources
             .values()
-            .filter(|s| std::fs::read(&s.path).ok().as_deref() != Some(&s.file[..]))
+            .filter(|s| std::fs::read(&s.path).ok().as_deref() != Some(&s.file()[..]))
             .map(|s| s.path.to_path_buf())
             .collect();
         v.sort();
@@ -752,7 +807,7 @@ impl Project {
             key,
             path: src.path.clone(),
             form: src.form,
-            file: src.file.clone(),
+            file: src.file().clone(),
             stamp: src.stamp,
         }
     }
@@ -786,13 +841,13 @@ impl Project {
         }
         for (key, was, s) in found.settled {
             if let Some(src) = self.sources.get_mut(&key)
-                && Arc::ptr_eq(&src.file, &was)
+                && Arc::ptr_eq(src.file(), &was)
             {
                 src.stamp = Some(s);
             }
         }
         let mut changes = found.changes;
-        changes.retain(|c| crate::outside::stands(self.sources.get(&c.key).map(|s| &s.file), c));
+        changes.retain(|c| crate::outside::stands(self.sources.get(&c.key).map(|s| s.file()), c));
         // A file gone from where it was read: if it is now where the
         // include doesn't look, it was moved there, and is said
         // ([`Project::left_out`]) rather than only taken for deleted.
@@ -824,7 +879,7 @@ impl Project {
                     Source {
                         path: change.path.as_path().into(),
                         form: change.form,
-                        file: file.clone(),
+                        file: OnceLock::from(file.clone()),
                         resource: resource.clone(),
                         // (Its time when it was read, not now: a write
                         // since then is still to be found.)
@@ -956,11 +1011,11 @@ impl Project {
                 _ if built(key, resources) => {}
                 Some(src) if src.resource[..] == bytes[..] => {}
                 Some(src) => {
-                    let text = self.source_bytes(key, src.form, bytes, Some(&src.file))?;
+                    let text = self.source_bytes(key, src.form, bytes, Some(&src.file()[..]))?;
                     let current = disk(&src.path);
-                    if text[..] == src.file[..] || current.as_deref() == Some(&text[..]) {
+                    if text[..] == src.file()[..] || current.as_deref() == Some(&text[..]) {
                         steps.push(Step::Adopt(*key, src.path.to_path_buf(), src.form, text));
-                    } else if current.as_deref() != Some(&src.file[..]) {
+                    } else if current.as_deref() != Some(&src.file()[..]) {
                         conflicts.push(src.path.to_path_buf());
                     } else {
                         steps.push(Step::Write(*key, src.path.to_path_buf(), src.form, text));
@@ -1000,7 +1055,7 @@ impl Project {
         for (key, src) in gone {
             match disk(&src.path) {
                 None => steps.push(Step::Remove(*key, src.path.to_path_buf())),
-                Some(d) if d[..] == src.file[..] => {
+                Some(d) if d[..] == src.file()[..] => {
                     steps.push(Step::Remove(*key, src.path.to_path_buf()))
                 }
                 Some(_) => conflicts.push(src.path.to_path_buf()),
@@ -1054,7 +1109,7 @@ impl Project {
                         Source {
                             path: path.as_path().into(),
                             form,
-                            file: Arc::from(text),
+                            file: OnceLock::from(Arc::<[u8]>::from(text)),
                             resource,
                             stamp: written_stamp,
                         },
@@ -1069,7 +1124,7 @@ impl Project {
                         Source {
                             path: path.into(),
                             form,
-                            file: Arc::from(text),
+                            file: OnceLock::from(Arc::<[u8]>::from(text)),
                             resource,
                             stamp: kept_stamp,
                         },
@@ -1098,7 +1153,7 @@ impl Project {
                 continue;
             };
             let other = src.path.to_path_buf();
-            crate::write_replacing_one_of_many(&lower, &src.file).map_err(io(&lower))?;
+            crate::write_replacing_one_of_many(&lower, &src.file()[..]).map_err(io(&lower))?;
             if other.exists() {
                 std::fs::remove_file(&other).map_err(io(&other))?;
             }
@@ -1172,7 +1227,9 @@ impl Project {
     fn reads_the_same(&self, key: &ResKey, a: &[u8], b: &[u8]) -> bool {
         let src = self.sources.get(key);
         let form = src.map_or_else(|| self.new_form(key), |s| s.form);
-        let file = src.map(|s| &s.file[..]);
+        // (The file matters only to an area's objects' locks, kept in its
+        // GIT: other files aren't read for it.)
+        let file = src.filter(|_| key.restype == ResType::GIT).map(|s| &s.file()[..]);
         match (self.source_bytes(key, form, a, file), self.source_bytes(key, form, b, file)) {
             (Ok(x), Ok(y)) => x == y,
             _ => false,
@@ -2565,5 +2622,102 @@ file: \"m.mod\"
         let re_opened = Package::read(&root2).unwrap();
         let t = re_opened.target("m").unwrap();
         assert_eq!(t.excludes, ["**/test_*.nss", "**/*.tlk.json"]);
+    }
+}
+
+/// ALFA: the source cache's file ([`SOURCE_CACHE`]): for each source file
+/// read, its path (from the project's folder), time, size and the resource
+/// it stands for. Written whole each time, to a file beside it first.
+mod source_cache {
+    use std::collections::HashMap;
+    use std::io::{BufWriter, Write};
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::{Conversion, Settings};
+    use crate::outside::Stamp;
+
+    const MAGIC: &[u8] = b"MG-ALFA-SOURCE-CACHE 1\n";
+
+    /// What the resources were made with: a cache made otherwise is not
+    /// used.
+    pub(super) fn fingerprint(settings: &Settings, conv: Conversion) -> String {
+        format!("mg {} {:?} {:?}", env!("CARGO_PKG_VERSION"), settings, conv)
+    }
+
+    /// A file's path as the cache keeps it.
+    pub(super) fn relative(root: &Path, path: &Path) -> String {
+        path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
+    }
+
+    /// The cache's entries, by path; empty when there is none, it can't be
+    /// read, or it was made otherwise.
+    pub(super) fn read(path: &Path, fingerprint: &str) -> HashMap<String, (Stamp, Arc<[u8]>)> {
+        parse(&std::fs::read(path).unwrap_or_default(), fingerprint).unwrap_or_default()
+    }
+
+    fn parse(d: &[u8], fingerprint: &str) -> Option<HashMap<String, (Stamp, Arc<[u8]>)>> {
+        let mut at = 0usize;
+        let mut take = |n: usize| -> Option<&[u8]> {
+            let part = d.get(at..at.checked_add(n)?)?;
+            at += n;
+            Some(part)
+        };
+        if take(MAGIC.len())? != MAGIC {
+            return None;
+        }
+        let u32_of = |b: &[u8]| u32::from_le_bytes(b.try_into().unwrap_or_default());
+        let u64_of = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap_or_default());
+        let n = u32_of(take(4)?) as usize;
+        if take(n)? != fingerprint.as_bytes() {
+            return None;
+        }
+        let count = u64_of(take(8)?) as usize;
+        let mut out = HashMap::with_capacity(count.min(1 << 20));
+        for _ in 0..count {
+            let n = u32_of(take(4)?) as usize;
+            let rel = String::from_utf8(take(n)?.to_vec()).ok()?;
+            let secs = u64_of(take(8)?);
+            let nanos = u32_of(take(4)?);
+            let size = u64_of(take(8)?);
+            let n = u64_of(take(8)?) as usize;
+            let resource: Arc<[u8]> = Arc::from(take(n)?);
+            let time = UNIX_EPOCH.checked_add(Duration::new(secs, nanos))?;
+            out.insert(rel, ((time, size), resource));
+        }
+        Some(out)
+    }
+
+    pub(super) fn write(
+        path: &Path,
+        fingerprint: &str,
+        entries: &[(String, Stamp, Arc<[u8]>)],
+    ) -> std::io::Result<()> {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("tmp");
+        {
+            let mut w = BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?);
+            w.write_all(MAGIC)?;
+            w.write_all(&(fingerprint.len() as u32).to_le_bytes())?;
+            w.write_all(fingerprint.as_bytes())?;
+            w.write_all(&(entries.len() as u64).to_le_bytes())?;
+            for (rel, (time, size), resource) in entries {
+                // (A time before 1970 can't be kept: that file is read
+                // again next time.)
+                let since = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+                w.write_all(&(rel.len() as u32).to_le_bytes())?;
+                w.write_all(rel.as_bytes())?;
+                w.write_all(&since.as_secs().to_le_bytes())?;
+                w.write_all(&since.subsec_nanos().to_le_bytes())?;
+                w.write_all(&size.to_le_bytes())?;
+                w.write_all(&(resource.len() as u64).to_le_bytes())?;
+                w.write_all(resource)?;
+            }
+            w.flush()?;
+        }
+        std::fs::rename(&tmp, path)
     }
 }
